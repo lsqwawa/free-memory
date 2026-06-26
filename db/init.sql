@@ -1,6 +1,6 @@
-﻿-- 畅记（ChangJi）数据库初始化脚本
+﻿-- FreeMemory 数据库初始化脚本
 -- 1) 先在 PostgreSQL 中创建目标数据库与用户（使用超级账号执行）。
--- 2) 再对 changji 库执行本 SQL 创建表结构。
+-- 2) 再对 FreeMemory 库执行本 SQL 创建表结构。
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -168,3 +168,4 @@ CREATE INDEX IF NOT EXISTS idx_attempt_items_session ON attempt_items(session_id
 CREATE INDEX IF NOT EXISTS idx_user_blank_progress_user ON user_blank_progress(user_id);
 CREATE INDEX IF NOT EXISTS idx_mistake_books_user ON mistake_books(user_id);
 CREATE INDEX IF NOT EXISTS idx_mistake_book_items_user ON mistake_book_items(user_id);
+
