@@ -1,6 +1,6 @@
 ﻿# FreeMemory
 
-FreeMemory 是一个用于上传 PDF、识别红蓝色重点、自动创建填空题并反复练习的便携记背工具。
+FreeMemory 是一个用于上传 PDF、识别信息重点、自动创建填空题并反复练习的便携记背工具。
 
 ## 技术栈
 - 前端：React + React Router + Redux Toolkit + TypeScript + Vite
