@@ -1,10 +1,23 @@
 ﻿import 'dotenv/config';
 
+function requireEnv(name: string, fallback?: string) {
+  const value = process.env[name] ?? fallback;
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+
+  return value;
+}
+
 export const env = {
   APP_PORT: Number(process.env.APP_PORT || 4000),
-  DATABASE_URL: process.env.DATABASE_URL || 'postgresql://postgres:xl241216@localhost:5432/FreeMemory?schema=public',
-  JWT_SECRET: process.env.JWT_SECRET || 'free-memory-dev-secret',
+  DATABASE_URL: requireEnv('DATABASE_URL', 'postgresql://postgres:xl241216@localhost:5432/FreeMemory?schema=public'),
+  JWT_SECRET: requireEnv('JWT_SECRET', 'free-memory-dev-secret'),
   JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN || '7d',
   UPLOAD_DIR: process.env.UPLOAD_DIR || './uploads',
   MAX_UPLOAD_MB: Number(process.env.MAX_UPLOAD_MB || 20),
+  LOG_LEVEL: process.env.LOG_LEVEL || 'info',
+  DB_POOL_MAX: Number(process.env.DB_POOL_MAX || 20),
+  DB_IDLE_TIMEOUT_MS: Number(process.env.DB_IDLE_TIMEOUT_MS || 30000),
+  SYNC_PARSE: process.env.SYNC_PARSE === 'true',
 };

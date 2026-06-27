@@ -1,0 +1,50 @@
+﻿import type { Request, Response } from 'express';
+
+export type RequestLogger = {
+  info: (message: string, extra?: Record<string, unknown>) => void;
+  warn: (message: string, extra?: Record<string, unknown>) => void;
+  error: (message: string, extra?: Record<string, unknown>) => void;
+};
+
+export function createRequestLogger(req: Request, res: Response): RequestLogger {
+  const requestId = (req as unknown as { requestId?: string }).requestId ?? res.getHeader('X-Request-Id')?.toString();
+
+  return {
+    info(message, extra) {
+      process.stdout.write(
+        JSON.stringify({
+          level: 'info',
+          message,
+          requestId,
+          method: req.method,
+          url: req.originalUrl,
+          ...extra,
+        }) + '\n',
+      );
+    },
+    warn(message, extra) {
+      process.stderr.write(
+        JSON.stringify({
+          level: 'warn',
+          message,
+          requestId,
+          method: req.method,
+          url: req.originalUrl,
+          ...extra,
+        }) + '\n',
+      );
+    },
+    error(message, extra) {
+      process.stderr.write(
+        JSON.stringify({
+          level: 'error',
+          message,
+          requestId,
+          method: req.method,
+          url: req.originalUrl,
+          ...extra,
+        }) + '\n',
+      );
+    },
+  };
+}

@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useSelector } from 'react-redux';
 import { apiFetch } from '../../shared/api';
 import type { RootState } from '../../app/store';
@@ -49,41 +49,37 @@ export function MistakesPage() {
     };
   }, [token]);
 
+  const statCards = stats
+    ? [
+        { label: '资料数', value: stats.documentCount, detail: `已解析 ${stats.parsedDocumentCount} 份` },
+        { label: '真题数', value: stats.questionCount, detail: `可练习 ${stats.blankCount} 空` },
+        { label: '总作答', value: stats.totalAttempts, detail: `正确 ${stats.correctTimes} / 错误 ${stats.wrongTimes}` },
+        { label: '正确率', value: `${stats.accuracy}%`, detail: '基于已记录数据' },
+      ]
+    : [];
+
   return (
     <section className="card stack">
-      <header className="stack small">
+      <header className="section-header">
         <span className="badge">学习统计</span>
         <h2>看整体掌握情况</h2>
-        <p className="muted">这里展示当前账号的资料数、真题数、正确率，以及最近的真实作答记录。</p>
+        <p className="muted">当前账号的资料数、真题数、正确率，以及最近的作答记录。</p>
       </header>
 
       {!token && <p className="error">请先登录后查看统计。</p>}
-      {loading && <p className="muted">正在加载统计数据...</p>}
+      {loading && <p className="muted loading-pulse">正在加载统计数据...</p>}
       {error && <p className="error">{error}</p>}
 
       {stats && (
         <>
           <div className="stat-grid">
-            <article className="card subtle stack small">
-              <span className="muted">资料数</span>
-              <strong className="stat-value">{stats.documentCount}</strong>
-              <span className="muted">其中已解析 {stats.parsedDocumentCount} 份</span>
-            </article>
-            <article className="card subtle stack small">
-              <span className="muted">真题数</span>
-              <strong className="stat-value">{stats.questionCount}</strong>
-              <span className="muted">可练习空位 {stats.blankCount} 个</span>
-            </article>
-            <article className="card subtle stack small">
-              <span className="muted">总作答数</span>
-              <strong className="stat-value">{stats.totalAttempts}</strong>
-              <span className="muted">正确 {stats.correctTimes} / 错误 {stats.wrongTimes}</span>
-            </article>
-            <article className="card subtle stack small">
-              <span className="muted">正确率</span>
-              <strong className="stat-value">{stats.accuracy}%</strong>
-              <span className="muted">基于已记录的作答数据</span>
-            </article>
+            {statCards.map((card, idx) => (
+              <article className="card subtle stack small" key={card.label} style={{ animationDelay: `${idx * 0.08}s` }}>
+                <span className="stat-label">{card.label}</span>
+                <strong className="stat-value">{card.value}</strong>
+                <span className="stat-detail">{card.detail}</span>
+              </article>
+            ))}
           </div>
 
           <section className="card subtle stack">
@@ -92,17 +88,21 @@ export function MistakesPage() {
               <span className="muted">{stats.recentSessions.length} 条记录</span>
             </header>
             {stats.recentSessions.length === 0 ? (
-              <p className="muted">还没有真实作答记录，先去练习页提交一次批改吧。</p>
+              <p className="muted">还没有作答记录，先去练习页提交一次批改吧。</p>
             ) : (
-              <div className="stack">
+              <div className="stack small">
                 {stats.recentSessions.map((s) => (
-                  <article className="card stack small" key={s.id}>
-                    <div className="row between">
+                  <div className="session-item" key={s.id}>
+                    <div className="stack small" style={{ gap: '4px' }}>
                       <span className="badge">单题练习</span>
-                      <span className="muted">{new Date(s.started_at).toLocaleString()}</span>
+                      <span className="muted" style={{ fontSize: '12px' }}>
+                        {new Date(s.started_at).toLocaleString()}
+                      </span>
                     </div>
-                    <p className="muted">正确 {s.correct_count} / 共 {s.total_count}</p>
-                  </article>
+                    <span className="stat-label">
+                      正确 <strong style={{ color: 'var(--accent)' }}>{s.correct_count}</strong> / 共 {s.total_count}
+                    </span>
+                  </div>
                 ))}
               </div>
             )}

@@ -1,6 +1,5 @@
 ﻿-- FreeMemory 数据库初始化脚本
--- 1) 先在 PostgreSQL 中创建目标数据库与用户（使用超级账号执行）。
--- 2) 再对 FreeMemory 库执行本 SQL 创建表结构。
+-- 在 PostgreSQL 中对 FreeMemory 库执行本 SQL 创建表结构。
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
@@ -21,6 +20,10 @@ CREATE TABLE IF NOT EXISTS documents (
   source_filename VARCHAR(512) NOT NULL,
   page_count INT,
   status VARCHAR(32) NOT NULL DEFAULT 'uploaded',
+  error_message TEXT,
+  knowledge_point_count INT,
+  blank_slot_count INT,
+  question_count INT,
   meta JSONB,
   created_at TIMESTAMP NOT NULL DEFAULT now(),
   updated_at TIMESTAMP NOT NULL DEFAULT now()
@@ -159,6 +162,7 @@ CREATE TABLE IF NOT EXISTS document_tags (
 );
 
 CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);
+CREATE INDEX IF NOT EXISTS idx_documents_status_user ON documents(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_knowledge_points_doc ON knowledge_points(document_id);
 CREATE INDEX IF NOT EXISTS idx_blank_slots_knowledge ON blank_slots(knowledge_point_id);
 CREATE INDEX IF NOT EXISTS idx_questions_knowledge ON questions(knowledge_point_id);
@@ -169,3 +173,37 @@ CREATE INDEX IF NOT EXISTS idx_user_blank_progress_user ON user_blank_progress(u
 CREATE INDEX IF NOT EXISTS idx_mistake_books_user ON mistake_books(user_id);
 CREATE INDEX IF NOT EXISTS idx_mistake_book_items_user ON mistake_book_items(user_id);
 
+-- 如果是已有库升级，补齐新增列（可重复执行）
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns WHERE table_name = 'documents' AND column_name = 'error_message'
+  ) THEN
+    EXECUTE 'ALTER TABLE documents ADD COLUMN error_message TEXT';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns WHERE table_name = 'documents' AND column_name = 'knowledge_point_count'
+  ) THEN
+    EXECUTE 'ALTER TABLE documents ADD COLUMN knowledge_point_count INT';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns WHERE table_name = 'documents' AND column_name = 'blank_slot_count'
+  ) THEN
+    EXECUTE 'ALTER TABLE documents ADD COLUMN blank_slot_count INT';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns WHERE table_name = 'documents' AND column_name = 'question_count'
+  ) THEN
+    EXECUTE 'ALTER TABLE documents ADD COLUMN question_count INT';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns WHERE table_name = 'knowledge_points' AND column_name = 'meta'
+  ) THEN
+    EXECUTE 'ALTER TABLE knowledge_points ADD COLUMN meta JSONB';
+  END IF;
+
+END
+$$;
