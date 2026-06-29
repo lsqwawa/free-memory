@@ -10,7 +10,7 @@ import { ensureDatabaseReady, pool, updateDocumentStatus } from './db';
 import { signToken } from './auth';
 import { env } from './env';
 import { requireAuth, type AuthenticatedRequest } from './auth-middleware';
-import { processDocumentAndGenerateQuestions } from './pipeline';
+import { processDocumentAndGenerateQuestions, processTextAndGenerateQuestions, processImageAndGenerateQuestions, generateBlanksForKnowledgePoint } from './pipeline';
 import { createRequestLogger } from './logger';
 
 fs.mkdirSync(path.resolve(env.UPLOAD_DIR), { recursive: true });
@@ -27,6 +27,18 @@ const upload = multer({
   fileFilter(_req, file, cb) {
     if (file.mimetype !== 'application/pdf') {
       cb(new Error('仅支持 PDF'));
+      return;
+    }
+    cb(null, true);
+  },
+});
+
+﻿const imageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter(_req, file, cb) {
+    if (!file.mimetype.startsWith('image/')) {
+      cb(new Error('仅支持图片文件'));
       return;
     }
     cb(null, true);
@@ -205,6 +217,137 @@ app.post(
     });
 
     log.info('document queued for background parsing', { documentId: document.id });
+    return res.status(202).json({ documentId: document.id, status: 'parsing' });
+  }),
+);
+
+﻿// POST /api/v1/documents/text - Create document from text input
+app.post(
+  '/api/v1/documents/text',
+  requireAuth,
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const { title, textContent } = req.body;
+
+    if (!textContent || typeof textContent !== 'string' || textContent.trim().length < 10) {
+      return res.status(400).json({ error: '请输入至少10个字符的文本内容' });
+    }
+
+    const log = createRequestLogger(req, res);
+    const docTitle = (title as string)?.trim() || '文本输入';
+
+    const documentResult = await pool.query<{ id: string }>(
+      `insert into documents (id, user_id, title, source_filename, status) values (gen_random_uuid(), $1, $2, $3, 'uploaded') returning id`,
+      [req.userId, docTitle, 'text-input'],
+    );
+    const document = documentResult.rows[0];
+
+    await updateDocumentStatus(document.id, 'parsing');
+
+    if (env.SYNC_PARSE) {
+      try {
+        const result = await processTextAndGenerateQuestions({
+          userId: req.userId!,
+          documentId: document.id,
+          textContent: textContent.trim(),
+        });
+
+        log.info('text document parsed synchronously', { documentId: document.id });
+
+        return res.status(201).json({
+          documentId: document.id,
+          status: 'parsed',
+          knowledgePointCount: result.knowledgePointCount,
+          blankSlotCount: result.blankSlotCount,
+          questionCount: result.questionCount,
+        });
+      } catch (error) {
+        log.error('text document sync parse failed', { documentId: document.id });
+        await updateDocumentStatus(document.id, 'parse_failed', error instanceof Error ? error.message : '解析失败');
+        return res.status(500).json({ error: '文本解析失败' });
+      }
+    }
+
+    processTextAndGenerateQuestions({
+      userId: req.userId!,
+      documentId: document.id,
+      textContent: textContent.trim(),
+    }).then(async (result) => {
+      await pool.query(
+        `update documents set knowledge_point_count = $1, blank_slot_count = $2, question_count = $3, updated_at = now() where id = $4`,
+        [result.knowledgePointCount, result.blankSlotCount, result.questionCount, document.id],
+      );
+    }).catch(async (error) => {
+      console.error('background text parse failed', error);
+      await updateDocumentStatus(document.id, 'parse_failed', error instanceof Error ? error.message : '解析失败');
+    });
+
+    return res.status(202).json({ documentId: document.id, status: 'parsing' });
+  }),
+);
+
+// POST /api/v1/documents/image - Create document from image upload with OCR
+app.post(
+  '/api/v1/documents/image',
+  requireAuth,
+  imageUpload.single('image'),
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const file = req.file;
+    const title = (req.body?.title as string | undefined)?.trim();
+    const log = createRequestLogger(req, res);
+
+    if (!file) {
+      return res.status(400).json({ error: '请上传图片文件' });
+    }
+
+    const docTitle = title || file.originalname;
+    const imageBase64 = file.buffer.toString('base64');
+
+    const documentResult = await pool.query<{ id: string }>(
+      `insert into documents (id, user_id, title, source_filename, status) values (gen_random_uuid(), $1, $2, $3, 'uploaded') returning id`,
+      [req.userId, docTitle, file.originalname],
+    );
+    const document = documentResult.rows[0];
+
+    await updateDocumentStatus(document.id, 'parsing');
+
+    if (env.SYNC_PARSE) {
+      try {
+        const result = await processImageAndGenerateQuestions({
+          userId: req.userId!,
+          documentId: document.id,
+          imageBase64,
+        });
+
+        log.info('image document parsed synchronously', { documentId: document.id });
+
+        return res.status(201).json({
+          documentId: document.id,
+          status: 'parsed',
+          knowledgePointCount: result.knowledgePointCount,
+          blankSlotCount: result.blankSlotCount,
+          questionCount: result.questionCount,
+        });
+      } catch (error) {
+        log.error('image document sync parse failed', { documentId: document.id });
+        await updateDocumentStatus(document.id, 'parse_failed', error instanceof Error ? error.message : '图片识别失败');
+        return res.status(500).json({ error: '图片识别或解析失败' });
+      }
+    }
+
+    processImageAndGenerateQuestions({
+      userId: req.userId!,
+      documentId: document.id,
+      imageBase64,
+    }).then(async (result) => {
+      await pool.query(
+        `update documents set knowledge_point_count = $1, blank_slot_count = $2, question_count = $3, updated_at = now() where id = $4`,
+        [result.knowledgePointCount, result.blankSlotCount, result.questionCount, document.id],
+      );
+    }).catch(async (error) => {
+      console.error('background image parse failed', error);
+      await updateDocumentStatus(document.id, 'parse_failed', error instanceof Error ? error.message : '图片识别失败');
+    });
+
     return res.status(202).json({ documentId: document.id, status: 'parsing' });
   }),
 );
@@ -932,6 +1075,184 @@ app.delete(
       await client.query(
         `update documents set knowledge_point_count = $1, blank_slot_count = $2, question_count = $3, updated_at = now() where id = $4`,
         [counts.rows[0].kp_count, counts.rows[0].blank_count, counts.rows[0].q_count, docId],
+      );
+
+      await client.query('commit');
+      return res.json({ success: true });
+    } catch (error) {
+      await client.query('rollback');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }),
+);
+
+
+// POST /api/v1/knowledge-points/:knowledgePointId/blanks - create blank from selected text
+app.post(
+  '/api/v1/knowledge-points/:knowledgePointId/blanks',
+  requireAuth,
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const { knowledgePointId } = req.params;
+    const { selectedText } = req.body;
+
+    if (!selectedText || typeof selectedText !== 'string' || selectedText.trim().length < 2) {
+      return res.status(400).json({ error: '选中文本太短' });
+    }
+
+    const kp = await pool.query<{ id: string; user_id: string; content_text: string; document_id: string }>(
+      'select id, user_id, content_text, document_id from knowledge_points where id = $1',
+      [knowledgePointId],
+    );
+    if (!kp.rows[0]) return res.status(404).json({ error: '知识点不存在' });
+    if (kp.rows[0].user_id !== req.userId) return res.status(403).json({ error: '无权操作' });
+
+    const normalizedAnswer = selectedText.trim().replace(/\s+/g, '').replace(/^[,.;:!?，。；：！？]+|[,.;:!?，。；：！？]+$/g, '');
+
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+
+      const countRes = await client.query<{ cnt: number }>(
+        'select count(*)::int as cnt from blank_slots where knowledge_point_id = $1',
+        [knowledgePointId],
+      );
+      const nextIndex = countRes.rows[0].cnt + 1;
+
+      const slot = await client.query<{ id: string }>(
+        "insert into blank_slots (id, knowledge_point_id, original_text, normalized_answer, color_type, char_start, char_end, order_index) values (gen_random_uuid(), $1, $2, $3, 'red', $4, $5, $6) returning id",
+        [knowledgePointId, selectedText.trim(), normalizedAnswer, null, null, nextIndex],
+      );
+      const blankSlotId = slot.rows[0].id;
+
+      const contentText = kp.rows[0].content_text;
+      const stemText = contentText.replace(selectedText.trim(), '____');
+      const stemHtml = contentText.replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(selectedText.trim(), '<strong>____</strong>');
+
+      const q = await client.query<{ id: string }>(
+        "insert into questions (id, knowledge_point_id, stem_html, stem_text, difficulty, status) values (gen_random_uuid(), $1, $2, $3, 1, 'active') returning id",
+        [knowledgePointId, stemHtml, stemText],
+      );
+
+      await client.query(
+        'insert into question_blanks (id, question_id, blank_slot_id, position_index, answer_text, answer_variants) values (gen_random_uuid(), $1, $2, 1, $3, $4)',
+        [q.rows[0].id, blankSlotId, normalizedAnswer, [selectedText.trim(), normalizedAnswer]],
+      );
+
+      // Update document counts
+      const docId = kp.rows[0].document_id;
+      const counts = await client.query<{ blank_count: number; q_count: number }>(
+        `select
+           (select count(*)::int from blank_slots bs join knowledge_points kp2 on kp2.id = bs.knowledge_point_id where kp2.document_id = $1) as blank_count,
+           (select count(*)::int from questions q join knowledge_points kp2 on kp2.id = q.knowledge_point_id where kp2.document_id = $1 and q.status = 'active') as q_count`,
+        [docId],
+      );
+      await client.query(
+        'update documents set blank_slot_count = $1, question_count = $2, updated_at = now() where id = $3',
+        [counts.rows[0].blank_count, counts.rows[0].q_count, docId],
+      );
+
+      await client.query('commit');
+      return res.json({ blankSlotId, questionId: q.rows[0].id });
+    } catch (error) {
+      await client.query('rollback');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }),
+);
+
+// POST /api/v1/knowledge-points/:knowledgePointId/generate-blanks - auto-generate blanks
+app.post(
+  '/api/v1/knowledge-points/:knowledgePointId/generate-blanks',
+  requireAuth,
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const { knowledgePointId } = req.params;
+
+    const kp = await pool.query<{ id: string; user_id: string; content_text: string; document_id: string }>(
+      'select id, user_id, content_text, document_id from knowledge_points where id = $1',
+      [knowledgePointId],
+    );
+    if (!kp.rows[0]) return res.status(404).json({ error: '知识点不存在' });
+    if (kp.rows[0].user_id !== req.userId) return res.status(403).json({ error: '无权操作' });
+
+    const result = await generateBlanksForKnowledgePoint(knowledgePointId, kp.rows[0].content_text);
+
+    // Update document counts
+    const docId = kp.rows[0].document_id;
+    const counts = await pool.query<{ blank_count: number; q_count: number }>(
+      `select
+         (select count(*)::int from blank_slots bs join knowledge_points kp2 on kp2.id = bs.knowledge_point_id where kp2.document_id = $1) as blank_count,
+         (select count(*)::int from questions q join knowledge_points kp2 on kp2.id = q.knowledge_point_id where kp2.document_id = $1 and q.status = 'active') as q_count`,
+      [docId],
+    );
+    await pool.query(
+      'update documents set blank_slot_count = $1, question_count = $2, updated_at = now() where id = $3',
+      [counts.rows[0].blank_count, counts.rows[0].q_count, docId],
+    );
+
+    return res.json({ success: true, ...result });
+  }),
+);
+
+// DELETE /api/v1/blanks/:blankId - delete a single blank slot and its question
+app.delete(
+  '/api/v1/blanks/:blankId',
+  requireAuth,
+  asyncHandler(async (req: AuthenticatedRequest, res) => {
+    const { blankId } = req.params;
+
+    const blank = await pool.query<{ id: string; user_id: string; knowledge_point_id: string; document_id: string }>(
+      `select bs.id, kp.user_id, bs.knowledge_point_id, kp.document_id
+       from blank_slots bs
+       join knowledge_points kp on kp.id = bs.knowledge_point_id
+       where bs.id = $1`,
+      [blankId],
+    );
+
+    if (!blank.rows[0]) return res.status(404).json({ error: '填空位不存在' });
+    if (blank.rows[0].user_id !== req.userId) return res.status(403).json({ error: '无权操作' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('begin');
+
+      await client.query(
+        `delete from attempt_items where session_id in (
+           select ps.id from practice_sessions ps
+           join question_blanks qb on qb.question_id = ps.target_id
+           where qb.blank_slot_id = $1
+         )`,
+        [blankId],
+      );
+      await client.query('delete from user_blank_progress where blank_slot_id = $1', [blankId]);
+      await client.query(
+        `with related as (select qb.question_id from question_blanks qb where qb.blank_slot_id = $1)
+         delete from mistake_book_items where blank_slot_id = $1 or question_id in (select question_id from related)`,
+        [blankId],
+      );
+      await client.query('delete from question_blanks where blank_slot_id = $1', [blankId]);
+      await client.query(
+        `delete from questions q using question_blanks qb
+         where qb.blank_slot_id = $1 and q.id = qb.question_id
+         and not exists (select 1 from question_blanks qb2 where qb2.question_id = q.id)`,
+        [blankId],
+      );
+      await client.query('delete from blank_slots where id = $1', [blankId]);
+
+      // Update document counts
+      const docId = blank.rows[0].document_id;
+      const counts = await pool.query<{ blank_count: number; q_count: number }>(
+        `select
+           (select count(*)::int from blank_slots bs2 join knowledge_points kp2 on kp2.id = bs2.knowledge_point_id where kp2.document_id = $1) as blank_count,
+           (select count(*)::int from questions q join knowledge_points kp2 on kp2.id = q.knowledge_point_id where kp2.document_id = $1 and q.status = 'active') as q_count`,
+        [docId],
+      );
+      await pool.query(
+        'update documents set blank_slot_count = $1, question_count = $2, updated_at = now() where id = $3',
+        [counts.rows[0].blank_count, counts.rows[0].q_count, docId],
       );
 
       await client.query('commit');

@@ -43,6 +43,12 @@ type QuestionsResponse = {
   questions: Question[];
 };
 
+type BlankItem = {
+  blankId: string;
+  originalText: string;
+  answer: string;
+};
+
 type KnowledgePoint = {
   id: string;
   sectionTitle: string | null;
@@ -53,6 +59,7 @@ type KnowledgePoint = {
   orderIndex: number;
   isHighlight: boolean;
   blankCount: number;
+  blanks: BlankItem[];
 };
 
 type KnowledgePointsResponse = {
@@ -81,15 +88,24 @@ function KnowledgePointCard({
   kp,
   onUpdate,
   onDelete,
+  onBlankCountChange,
 }: {
   kp: KnowledgePoint;
   onUpdate: (id: string, data: Partial<KnowledgePoint>) => void;
   onDelete: (id: string) => void;
+  onBlankCountChange?: (id: string, delta: number) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState(kp.sectionTitle || '');
   const [editContent, setEditContent] = useState(kp.contentText);
   const [saving, setSaving] = useState(false);
+  const [localBlanks, setLocalBlanks] = useState<BlankItem[]>(kp.blanks ?? []);
+  const [generatingBlanks, setGeneratingBlanks] = useState(false);
+
+  // Sync blanks when kp changes
+  if (JSON.stringify(kp.blanks) !== JSON.stringify(localBlanks) && !generatingBlanks) {
+    setLocalBlanks(kp.blanks ?? []);
+  }
 
   const handleSave = async () => {
     setSaving(true);
@@ -126,6 +142,34 @@ function KnowledgePointCard({
   const handleDeleteClick = async () => {
     if (!window.confirm('确定删除该知识点？关联的题目也会一并删除，此操作不可恢复。')) return;
     onDelete(kp.id);
+  };
+
+  const handleDeleteBlank = async (blankId: string) => {
+    try {
+      await apiFetch(`/api/v1/blanks/${blankId}`, { method: 'DELETE' });
+      setLocalBlanks((prev) => prev.filter((b) => b.blankId !== blankId));
+      onBlankCountChange?.(kp.id, -1);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleGenerateBlanks = async () => {
+    setGeneratingBlanks(true);
+    try {
+      const res = await apiFetch<{ blankSlotCount: number; questionCount: number }>(
+        `/api/v1/knowledge-points/${kp.id}/generate-blanks`,
+        { method: 'POST' },
+      );
+      // Reload blanks from server
+      onUpdate(kp.id, { blankCount: res.blankSlotCount });
+      // Trigger a re-fetch by updating with empty data - parent will reload
+      window.location.reload();
+    } catch {
+      // ignore
+    } finally {
+      setGeneratingBlanks(false);
+    }
   };
 
   return (
@@ -194,9 +238,40 @@ function KnowledgePointCard({
         <p className="kp-content">{kp.contentText}</p>
       )}
 
-      {kp.blankCount > 0 && (
-        <span className="muted" style={{ fontSize: '12px' }}>{kp.blankCount} 个填空位</span>
-      )}
+      {/* Blanks section */}
+      <div className="kp-blanks-section">
+        <div className="row between" style={{ alignItems: 'center' }}>
+          <span className="muted" style={{ fontSize: '12px' }}>
+            填空项（{localBlanks.length} 个空位）
+          </span>
+          <button
+            className="btn btn-sm"
+            onClick={handleGenerateBlanks}
+            disabled={generatingBlanks}
+            type="button"
+          >
+            {generatingBlanks ? '生成中..' : '🔄 自动生成填空'}
+          </button>
+        </div>
+        {localBlanks.length > 0 ? (
+          <div className="kp-blank-chips">
+            {localBlanks.map((blank) => (
+              <span className="kp-blank-chip" key={blank.blankId}>
+                <code>{blank.originalText}</code>
+                <button
+                  className="kp-blank-remove"
+                  onClick={() => handleDeleteBlank(blank.blankId)}
+                  title="删除此填空项"
+                >
+                  ×
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : (
+          <span className="muted" style={{ fontSize: '12px' }}>暂无填空项，点击上方按钮自动生成</span>
+        )}
+      </div>
     </article>
   );
 }
@@ -447,8 +522,8 @@ function DocumentDetail({
                   <p className="stem">{q.stemText}</p>
                   <div className="row">
                     {q.blanks.map((b) => (
-                      <span className={`badge ${b.colorType === 'red' ? 'badge-red' : 'badge-blue'}`} key={b.blankId}>
-                        {b.colorType === 'red' ? '红色重点' : '蓝色重点'}：{b.answerText}
+                      <span className="badge badge-red" key={b.blankId}>
+                        重点：{b.answerText}
                       </span>
                     ))}
                   </div>
@@ -473,6 +548,19 @@ export function DocumentsPage() {
   const [uploading, setUploading] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const uploadDisabled = useMemo(() => !token || !file || uploading, [token, file, uploading]);
+  // Upload tab state
+  type UploadTab = 'pdf' | 'text' | 'image';
+  const [activeTab, setActiveTab] = useState<UploadTab>('pdf');
+
+  // Text input state
+  const [textContent, setTextContent] = useState('');
+  const [textTitle, setTextTitle] = useState('');
+  const textSubmitDisabled = useMemo(() => !token || textContent.trim().length < 10 || uploading, [token, textContent, uploading]);
+
+  // Image upload state
+  const [imageFile, setImageFile] = useState<File | null>(null);
+  const [imageTitle, setImageTitle] = useState('');
+  const imageSubmitDisabled = useMemo(() => !token || !imageFile || uploading, [token, imageFile, uploading]);
 
   // Document list state
   const [documents, setDocuments] = useState<DocumentItem[]>([]);
@@ -535,6 +623,60 @@ export function DocumentsPage() {
     }
   };
 
+
+  const submitText = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!textContent.trim() || !token) return;
+    setUploading(true);
+    setMessage(null);
+    try {
+      const res = await apiFetch<UploadResponse>('/api/v1/documents/text', {
+        method: 'POST',
+        body: JSON.stringify({ title: textTitle.trim() || undefined, textContent: textContent.trim() }),
+      });
+      if (res.status === 'parsed' && res.questionCount != null) {
+        setMessage(`文本解析完成：${res.questionCount} 道真题，${res.blankSlotCount ?? 0} 个重点空位。`);
+      } else {
+        setMessage('文本提交成功，正在解析中，请稍候..');
+      }
+      setTextContent('');
+      setTextTitle('');
+      loadDocuments();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '文本提交失败');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const submitImage = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!imageFile || !token) return;
+    setUploading(true);
+    setMessage(null);
+    try {
+      const form = new FormData();
+      form.append('image', imageFile);
+      if (imageTitle.trim()) form.append('title', imageTitle.trim());
+      const res = await apiFetch<UploadResponse>('/api/v1/documents/image', {
+        method: 'POST',
+        body: form,
+      });
+      if (res.status === 'parsed' && res.questionCount != null) {
+        setMessage(`图片识别完成：${res.questionCount} 道真题，${res.blankSlotCount ?? 0} 个重点空位。`);
+      } else {
+        setMessage('图片上传成功，正在OCR识别中，请稍候..');
+      }
+      setImageFile(null);
+      setImageTitle('');
+      loadDocuments();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '图片上传失败');
+    } finally {
+      setUploading(false);
+    }
+  };
+
   /* ---- Actions ---- */
 
   const handleCopyId = async (id: string) => {
@@ -589,30 +731,81 @@ export function DocumentsPage() {
     <section className="card stack">
       <header className="section-header">
         <span className="badge">资料库</span>
-        <h2>上传 PDF</h2>
-        <p className="muted">上传后系统会自动识别重点内容，去除页眉页脚，并生成可练习的填空真题。</p>
+        <h2>添加学习资料</h2>
+        <p className="muted">支持 PDF 上传、文本输入、图片识别三种方式，系统会自动提取知识点并生成填空真题。</p>
       </header>
 
-      <form className="stack" onSubmit={submitUpload}>
-        <label className="field">
-          <span>文档标题（可选，不填写默认使用文件名称）</span>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="输入资料名称" />
-        </label>
-        <label className="upload-area">
-          <input type="file" accept="application/pdf" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-          <div className="upload-box">
-            <span className="upload-icon">{file ? '📄' : '📁'}</span>
-            <strong>{file ? file.name : '点击或拖拽 PDF 到此区域'}</strong>
-            <span className="upload-hint">最大 20MB，仅支持 PDF</span>
-          </div>
-        </label>
-        <button className="btn primary" disabled={uploadDisabled} type="submit">
-          {uploading ? '上传中..' : '上传并生成真题'}
-        </button>
-      </form>
+      <div className="upload-tabs">
+        <button className={`upload-tab ${activeTab === 'pdf' ? 'active' : ''}`} onClick={() => { setActiveTab('pdf'); setMessage(null); }}>📄 PDF 上传</button>
+        <button className={`upload-tab ${activeTab === 'text' ? 'active' : ''}`} onClick={() => { setActiveTab('text'); setMessage(null); }}>📝 文本输入</button>
+        <button className={`upload-tab ${activeTab === 'image' ? 'active' : ''}`} onClick={() => { setActiveTab('image'); setMessage(null); }}>🖼️ 图片识别</button>
+      </div>
 
-      {message && <p className={message.startsWith('上传') ? 'success' : 'error'}>{message}</p>}
-      {!token && <p className="error">请先登录后再上传资料。</p>}
+      {activeTab === 'pdf' && (
+        <form className="stack" onSubmit={submitUpload}>
+          <label className="field">
+            <span>文档标题（可选，不填写默认使用文件名称）</span>
+            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="输入资料名称" />
+          </label>
+          <label className="upload-area">
+            <input type="file" accept="application/pdf" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+            <div className="upload-box">
+              <span className="upload-icon">{file ? '📄' : '📁'}</span>
+              <strong>{file ? file.name : '点击或拖拽 PDF 到此区域'}</strong>
+              <span className="upload-hint">最大 20MB，仅支持 PDF</span>
+            </div>
+          </label>
+          <button className="btn primary" disabled={uploadDisabled} type="submit">
+            {uploading ? '上传中..' : '上传并生成真题'}
+          </button>
+        </form>
+      )}
+
+      {activeTab === 'text' && (
+        <form className="stack" onSubmit={submitText}>
+          <label className="field">
+            <span>资料标题（可选）</span>
+            <input value={textTitle} onChange={(e) => setTextTitle(e.target.value)} placeholder="输入资料名称" />
+          </label>
+          <label className="field">
+            <span>粘贴或输入学习内容</span>
+            <textarea
+              className="text-input-area"
+              value={textContent}
+              onChange={(e) => setTextContent(e.target.value)}
+              placeholder="在此粘贴或输入备考知识点内容，支持带序号的条目格式（如 1. 2. 3.）..."
+              rows={10}
+            />
+            <span className="muted" style={{ fontSize: '12px' }}>{textContent.length} 字符</span>
+          </label>
+          <button className="btn primary" disabled={textSubmitDisabled} type="submit">
+            {uploading ? '解析中..' : '提交并生成真题'}
+          </button>
+        </form>
+      )}
+
+      {activeTab === 'image' && (
+        <form className="stack" onSubmit={submitImage}>
+          <label className="field">
+            <span>资料标题（可选）</span>
+            <input value={imageTitle} onChange={(e) => setImageTitle(e.target.value)} placeholder="输入资料名称" />
+          </label>
+          <label className="upload-area">
+            <input type="file" accept="image/*" onChange={(e) => setImageFile(e.target.files?.[0] ?? null)} />
+            <div className="upload-box">
+              <span className="upload-icon">{imageFile ? '🖼️' : '📷'}</span>
+              <strong>{imageFile ? imageFile.name : '点击或拖拽图片到此区域'}</strong>
+              <span className="upload-hint">最大 10MB，支持 JPG/PNG/WEBP，AI 会识别图片中的文字</span>
+            </div>
+          </label>
+          <button className="btn primary" disabled={imageSubmitDisabled} type="submit">
+            {uploading ? '识别中..' : '上传并识别真题'}
+          </button>
+        </form>
+      )}
+
+      {message && <p className={message.includes('完成') || message.includes('成功') ? 'success' : 'error'}>{message}</p>}
+      {!token && <p className="error">请先登录后再添加资料。</p>}
 
       <section className="card subtle stack">
         <header className="row between">
@@ -625,7 +818,7 @@ export function DocumentsPage() {
         {listError && <p className="error">{listError}</p>}
 
         {!listLoading && documents.length === 0 && (
-          <p className="muted">暂无资料，先上传一份 PDF 吧。</p>
+          <p className="muted">暂无资料，请添加学习资料。</p>
         )}
 
         <div className="stack small">

@@ -129,7 +129,7 @@ export function PracticePage() {
         <p className="muted">输入文档 ID 后加载已生成的真题，逐空回忆并提交批改。</p>
       </header>
 
-      <div className="row">
+      <div className="row row-stack-mobile">
         <label className="field-horize flex-1">
           <span>文档 ID</span>
           <input className="flex-1" value={documentId} onChange={(e) => setDocumentId(e.target.value)} placeholder="输入上传后返回的 documentId" />

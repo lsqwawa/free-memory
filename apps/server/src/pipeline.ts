@@ -418,6 +418,126 @@ function deduplicateKnowledgeDrafts(items: KnowledgeDraft[]) {
   return result.slice(0, 200);
 }
 
+
+/* ------------------------------------------------------------------ */
+/*  Generate blanks for a single knowledge point (API)                 */
+/* ------------------------------------------------------------------ */
+
+export async function generateBlanksForKnowledgePoint(
+  knowledgePointId: string,
+  contentText: string,
+) {
+  const blanks = buildBlankDraftsFromText(contentText, 'red');
+  const client = await pool.connect();
+
+  try {
+    await client.query('begin');
+
+    // Delete existing blanks and questions for this KP
+    await client.query(
+      'delete from question_blanks where question_id in (select id from questions where knowledge_point_id = $1)',
+      [knowledgePointId],
+    );
+    await client.query('delete from questions where knowledge_point_id = $1', [knowledgePointId]);
+    await client.query('delete from blank_slots where knowledge_point_id = $1', [knowledgePointId]);
+
+    let blankSlotCount = 0;
+    let questionCount = 0;
+
+    if (blanks.length > 0) {
+      let stemText = contentText;
+      let stemHtml = escapeHtml(contentText);
+
+      for (const blank of blanks) {
+        stemText = stemText.replace(blank.originalText, '____');
+        stemHtml = stemHtml.replace(escapeHtml(blank.originalText), '<strong>____</strong>');
+      }
+
+      const q = await client.query<{ id: string }>(
+        "insert into questions (id, knowledge_point_id, stem_html, stem_text, difficulty, status) values (gen_random_uuid(), $1, $2, $3, 1, 'active') returning id",
+        [knowledgePointId, stemHtml, stemText],
+      );
+      const questionId = q.rows[0].id;
+      questionCount = 1;
+
+      for (let bi = 0; bi < blanks.length; bi++) {
+        const blank = blanks[bi];
+        const slot = await client.query<{ id: string }>(
+          "insert into blank_slots (id, knowledge_point_id, original_text, normalized_answer, color_type, char_start, char_end, order_index) values (gen_random_uuid(), $1, $2, $3, 'red', $4, $5, $6) returning id",
+          [knowledgePointId, blank.originalText, blank.normalizedAnswer, null, null, bi + 1],
+        );
+        blankSlotCount += 1;
+
+        await client.query(
+          'insert into question_blanks (id, question_id, blank_slot_id, position_index, answer_text, answer_variants) values (gen_random_uuid(), $1, $2, $3, $4, $5)',
+          [questionId, slot.rows[0].id, bi + 1, blank.normalizedAnswer, [blank.originalText, blank.normalizedAnswer]],
+        );
+      }
+    }
+
+    await client.query('commit');
+    return { blankSlotCount, questionCount };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  User manual blank creation                                         */
+/* ------------------------------------------------------------------ */
+
+export async function createUserBlank(
+  knowledgePointId: string,
+  contentText: string,
+  selectedText: string,
+) {
+  const normalizedAnswer = selectedText.trim().replace(/\s+/g, '').replace(/^[,.;:!?，。；：！？]+|[,.;:!?，。；：！？]+$/g, '');
+  if (!normalizedAnswer || normalizedAnswer.length < 2) {
+    throw new Error('选中文本太短，至少需要2个字符');
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+
+    const countRes = await client.query<{ cnt: number }>(
+      'select count(*)::int as cnt from blank_slots where knowledge_point_id = $1',
+      [knowledgePointId],
+    );
+    const nextIndex = countRes.rows[0].cnt + 1;
+
+    const slot = await client.query<{ id: string }>(
+      "insert into blank_slots (id, knowledge_point_id, original_text, normalized_answer, color_type, char_start, char_end, order_index) values (gen_random_uuid(), $1, $2, $3, 'red', $4, $5, $6) returning id",
+      [knowledgePointId, selectedText.trim(), normalizedAnswer, null, null, nextIndex],
+    );
+    const blankSlotId = slot.rows[0].id;
+
+    const stemText = contentText.replace(selectedText.trim(), '____');
+    const stemHtml = escapeHtml(contentText).replace(escapeHtml(selectedText.trim()), '<strong>____</strong>');
+
+    const q = await client.query<{ id: string }>(
+      "insert into questions (id, knowledge_point_id, stem_html, stem_text, difficulty, status) values (gen_random_uuid(), $1, $2, $3, 1, 'active') returning id",
+      [knowledgePointId, stemHtml, stemText],
+    );
+
+    await client.query(
+      'insert into question_blanks (id, question_id, blank_slot_id, position_index, answer_text, answer_variants) values (gen_random_uuid(), $1, $2, 1, $3, $4)',
+      [q.rows[0].id, blankSlotId, normalizedAnswer, [selectedText.trim(), normalizedAnswer]],
+    );
+
+    await client.query('commit');
+    return { blankSlotId, questionId: q.rows[0].id };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 function escapeHtml(text: string) {
   return text
     .replace(/&/g, '&amp;')
@@ -427,3 +547,365 @@ function escapeHtml(text: string) {
 }
 
 
+/* ------------------------------------------------------------------ */
+/*  Text input processing                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Process plain text input (from user typing/pasting) and generate knowledge points + questions.
+ */
+
+/* ------------------------------------------------------------------ */
+/*  MiMo AI Knowledge Point Extraction                                 */
+/* ------------------------------------------------------------------ */
+
+interface AiExtractedPoint {
+  title: string;
+  content: string;
+  blanks: string[];
+}
+
+const MIMO_API_URL_CONST = 'https://api.xiaomimimo.com/v1/chat/completions';
+
+async function aiExtractKnowledgePoints(fullText: string, apiKey: string): Promise<KnowledgeDraft[] | null> {
+  if (!apiKey) return null;
+
+  const maxChars = 15000;
+  const truncated = fullText.length > maxChars ? fullText.slice(0, maxChars) + '\n...(内容过长已截断)' : fullText;
+
+  const prompt = `你是一名公务员考试/事业编考试辅导专家。请分析以下备考资料，提取出所有需要记忆和理解的知识点。
+
+## 任务要求
+
+1. **按序号拆分（最重要）**：如果原文中有编号（如1. 2. 3. 或一、二、三、或(1)(2)(3)或①②③），必须严格按照编号拆分，每个编号对应一个独立的知识点。编号格式包括但不限于：阿拉伯数字序号（1. 2. 3.）、中文序号（一、二、三、）、括号序号（(1)(2)或（一）（二））、圈号（①②③）。
+2. **知识点拆分**：如果没有明显编号，则将内容拆分为独立、完整的知识点单元。每个知识点应该是"一个需要记住的核心事实或规则"。
+3. **标题**：以序号作为标题前缀（如"1. 行政处罚法"、"二、行政复议范围"），再加上简短的总结性短语（不超过20字）。
+4. **内容**：保留知识点的完整原文表述，不要遗漏关键细节（如数字、年限、比例、条件等）。
+5. **填空（必须）**：每个知识点必须至少提供1个填空关键词，最多3个。要求：
+   - 该术语是该知识点中最核心、最容易遗忘的关键词
+   - 优先选择：专有名词、数字、法律名称《》、政策名称、时间节点、百分比、具体条件、法律术语（如"行政复议"、"行政处罚"）
+   - 每个关键词长度 2-20 个字
+   - 去掉后能通过上下文推断
+6. **忽略**：页眉页脚、页码、目录索引、章节分隔符、页码标注等无意义内容。
+
+## 输出格式
+
+严格返回以下 JSON，不要包含任何其他文字、解释或 markdown 标记：
+
+{"points":[{"title":"知识点标题","content":"知识点完整原文内容","blanks":["填空关键词1","填空关键词2"]}]}
+
+## 备考资料内容
+
+${truncated}`;
+
+  try {
+    const response = await fetch(MIMO_API_URL_CONST, {
+      method: 'POST',
+      headers: {
+        'api-key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'mimo-v2.5-pro',
+        messages: [
+          { role: 'system', content: '你是公考辅导领域的 AI 助手。你的任务是从备考资料中精准提取知识点并生成高质量填空题。你只输出合法的 JSON，不输出任何多余内容。' },
+          { role: 'user', content: prompt },
+        ],
+        max_completion_tokens: 4096,
+        temperature: 0.2,
+        top_p: 0.9,
+        stream: false,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error('MiMo API error:', response.status, await response.text());
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content;
+    if (!content) return null;
+
+    let jsonStr = content.trim();
+    const jsonMatch = jsonStr.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (jsonMatch) jsonStr = jsonMatch[1].trim();
+    const braceStart = jsonStr.indexOf('{');
+    const braceEnd = jsonStr.lastIndexOf('}');
+    if (braceStart >= 0 && braceEnd > braceStart) jsonStr = jsonStr.slice(braceStart, braceEnd + 1);
+
+    const parsed = JSON.parse(jsonStr);
+    if (!parsed.points || !Array.isArray(parsed.points)) return null;
+
+    return parsed.points
+      .filter((p: any) => p.title && p.content && p.content.length > 10)
+      .map((p: any) => ({
+        title: p.title.slice(0, 50),
+        contentText: p.content,
+        contentHtml: '<p>' + p.content.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</p>',
+        pageFrom: null,
+        pageTo: null,
+      }));
+  } catch (err) {
+    console.error('MiMo AI extraction failed:', err);
+    return null;
+  }
+}
+
+export async function processTextAndGenerateQuestions(input: {
+  userId: string;
+  documentId: string;
+  textContent: string;
+}) {
+  const rawLines = input.textContent.split(/\n/).map(l => l.trim());
+
+  // Try AI extraction first
+  let knowledgeDrafts: KnowledgeDraft[] = [];
+  const mimoApiKey = process.env.MIMO_API_KEY || '';
+
+  if (mimoApiKey && input.textContent.length > 50) {
+    console.log('Attempting MiMo AI extraction for text input...');
+    const aiResult = await aiExtractKnowledgePoints(input.textContent, mimoApiKey);
+    if (aiResult && aiResult.length > 0) {
+      console.log(`MiMo AI extracted ${aiResult.length} knowledge points from text`);
+      knowledgeDrafts = aiResult;
+    }
+  }
+
+  // Fallback to rule-based
+  if (knowledgeDrafts.length === 0) {
+    const cleanedPages: string[][] = [rawLines.filter(l => l.length > 0)];
+    knowledgeDrafts = extractKnowledgeFromPages(cleanedPages);
+  }
+
+  // Store to database
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+
+    let knowledgePointCount = 0;
+    let blankSlotCount = 0;
+    let questionCount = 0;
+
+    for (let index = 0; index < knowledgeDrafts.length; index++) {
+      const draft = knowledgeDrafts[index];
+      const kp = await client.query<{ id: string }>(
+        `insert into knowledge_points
+           (id, document_id, user_id, page_from, page_to, section_title, content_text, content_html, order_index)
+         values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)
+         returning id`,
+        [input.documentId, input.userId, draft.pageFrom, draft.pageTo, draft.title, draft.contentText, draft.contentHtml, index + 1],
+      );
+      const knowledgePointId = kp.rows[0].id;
+      knowledgePointCount += 1;
+
+      const blanks = buildBlankDraftsFromText(draft.contentText, 'red');
+      if (blanks.length === 0) continue;
+
+      let stemText = draft.contentText;
+      let stemHtml = escapeHtml(draft.contentText);
+      for (const blank of blanks) {
+        stemText = stemText.replace(blank.originalText, '____');
+        stemHtml = stemHtml.replace(escapeHtml(blank.originalText), '<strong>____</strong>');
+      }
+
+      const q = await client.query<{ id: string }>(
+        `insert into questions (id, knowledge_point_id, stem_html, stem_text, difficulty, status)
+         values (gen_random_uuid(), $1, $2, $3, 1, 'active') returning id`,
+        [knowledgePointId, stemHtml, stemText],
+      );
+      const questionId = q.rows[0].id;
+      questionCount += 1;
+
+      for (let bi = 0; bi < blanks.length; bi++) {
+        const blank = blanks[bi];
+        const slot = await client.query<{ id: string }>(
+          `insert into blank_slots (id, knowledge_point_id, original_text, normalized_answer, color_type, char_start, char_end, order_index)
+           values (gen_random_uuid(), $1, $2, $3, 'red', $4, $5, $6) returning id`,
+          [knowledgePointId, blank.originalText, blank.normalizedAnswer, null, null, bi + 1],
+        );
+        blankSlotCount += 1;
+
+        await client.query(
+          `insert into question_blanks (id, question_id, blank_slot_id, position_index, answer_text, answer_variants)
+           values (gen_random_uuid(), $1, $2, $3, $4, $5)`,
+          [questionId, slot.rows[0].id, bi + 1, blank.normalizedAnswer, [blank.originalText, blank.normalizedAnswer]],
+        );
+      }
+    }
+
+    await client.query(
+      `update documents set status = 'parsed', page_count = 1, updated_at = now() where id = $1`,
+      [input.documentId],
+    );
+
+    await client.query('commit');
+    return { knowledgePointCount, blankSlotCount, questionCount };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Image OCR with MiMo                                                */
+/* ------------------------------------------------------------------ */
+
+const MIMO_OMNI_MODEL = 'mimo-v2-omni';
+
+async function ocrImageWithMiMo(imageBase64: string, apiKey: string): Promise<string> {
+  const dataUrl = `data:image/png;base64,${imageBase64}`;
+
+  const response = await fetch('https://api.xiaomimimo.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'api-key': apiKey,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: MIMO_OMNI_MODEL,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: '请仔细识别这张图片中的所有文字内容，保持原文的段落结构和序号格式，完整输出图片中的文字。如果是备考资料（公务员考试/事业编考试），请保留所有知识点、要点、定义、法规条文等关键信息。只输出识别到的文字内容，不要添加额外解释。',
+            },
+            {
+              type: 'image_url',
+              image_url: { url: dataUrl },
+            },
+          ],
+        },
+      ],
+      max_completion_tokens: 4096,
+      temperature: 0.1,
+      stream: false,
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(`MiMo OCR API error: ${response.status} ${errText}`);
+  }
+
+  const data = (await response.json()) as {
+    choices?: { message?: { content?: string } }[];
+  };
+
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) throw new Error('MiMo OCR returned empty content');
+
+  return content.trim();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Image upload processing                                            */
+/* ------------------------------------------------------------------ */
+
+export async function processImageAndGenerateQuestions(input: {
+  userId: string;
+  documentId: string;
+  imageBase64: string;
+}) {
+  const mimoApiKey = process.env.MIMO_API_KEY || '';
+  if (!mimoApiKey) throw new Error('MIMO_API_KEY not configured');
+
+  // Step 1: OCR the image
+  console.log('OCR-ing image with MiMo mimo-v2-omni...');
+  const ocrText = await ocrImageWithMiMo(input.imageBase64, mimoApiKey);
+  console.log(`OCR extracted ${ocrText.length} characters from image`);
+
+  if (!ocrText || ocrText.length < 10) {
+    throw new Error('Image OCR did not find enough text content');
+  }
+
+  // Step 2: Extract knowledge points from OCR text using AI
+  let knowledgeDrafts: KnowledgeDraft[] = [];
+
+  const aiResult = await aiExtractKnowledgePoints(ocrText, mimoApiKey);
+  if (aiResult && aiResult.length > 0) {
+    console.log(`MiMo AI extracted ${aiResult.length} knowledge points from image OCR`);
+    knowledgeDrafts = aiResult;
+  }
+
+  // Fallback to rule-based
+  if (knowledgeDrafts.length === 0) {
+    const lines = ocrText.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+    const cleanedPages: string[][] = [lines];
+    knowledgeDrafts = extractKnowledgeFromPages(cleanedPages);
+  }
+
+  // Store to database
+  const client = await pool.connect();
+  try {
+    await client.query('begin');
+
+    let knowledgePointCount = 0;
+    let blankSlotCount = 0;
+    let questionCount = 0;
+
+    for (let index = 0; index < knowledgeDrafts.length; index++) {
+      const draft = knowledgeDrafts[index];
+      const kp = await client.query<{ id: string }>(
+        `insert into knowledge_points
+           (id, document_id, user_id, page_from, page_to, section_title, content_text, content_html, order_index)
+         values (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8)
+         returning id`,
+        [input.documentId, input.userId, draft.pageFrom, draft.pageTo, draft.title, draft.contentText, draft.contentHtml, index + 1],
+      );
+      const knowledgePointId = kp.rows[0].id;
+      knowledgePointCount += 1;
+
+      const blanks = buildBlankDraftsFromText(draft.contentText, 'red');
+      if (blanks.length === 0) continue;
+
+      let stemText = draft.contentText;
+      let stemHtml = escapeHtml(draft.contentText);
+      for (const blank of blanks) {
+        stemText = stemText.replace(blank.originalText, '____');
+        stemHtml = stemHtml.replace(escapeHtml(blank.originalText), '<strong>____</strong>');
+      }
+
+      const q = await client.query<{ id: string }>(
+        `insert into questions (id, knowledge_point_id, stem_html, stem_text, difficulty, status)
+         values (gen_random_uuid(), $1, $2, $3, 1, 'active') returning id`,
+        [knowledgePointId, stemHtml, stemText],
+      );
+      const questionId = q.rows[0].id;
+      questionCount += 1;
+
+      for (let bi = 0; bi < blanks.length; bi++) {
+        const blank = blanks[bi];
+        const slot = await client.query<{ id: string }>(
+          `insert into blank_slots (id, knowledge_point_id, original_text, normalized_answer, color_type, char_start, char_end, order_index)
+           values (gen_random_uuid(), $1, $2, $3, 'red', $4, $5, $6) returning id`,
+          [knowledgePointId, blank.originalText, blank.normalizedAnswer, null, null, bi + 1],
+        );
+        blankSlotCount += 1;
+
+        await client.query(
+          `insert into question_blanks (id, question_id, blank_slot_id, position_index, answer_text, answer_variants)
+           values (gen_random_uuid(), $1, $2, $3, $4, $5)`,
+          [questionId, slot.rows[0].id, bi + 1, blank.normalizedAnswer, [blank.originalText, blank.normalizedAnswer]],
+        );
+      }
+    }
+
+    await client.query(
+      `update documents set status = 'parsed', page_count = 1, updated_at = now() where id = $1`,
+      [input.documentId],
+    );
+
+    await client.query('commit');
+    return { knowledgePointCount, blankSlotCount, questionCount, ocrText };
+  } catch (error) {
+    await client.query('rollback');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
